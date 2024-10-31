@@ -1,0 +1,486 @@
+---
+title: | 
+  | Анализ структуры доходов граждан
+  | в разрезе муниципальных образований в 2018-2022 годах.
+author: "Ярослав Снарский"
+date: "31 10 2024"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+mainfont: "Tempora"  # шрифт, поддерживающий кириллицу
+sansfont: "Tempora"                 # Шрифт с кириллицей для текста без засечек
+monofont: "Tempora"  # Шрифт для моноширинного текста с кириллицей
+header-includes:
+   - \newfontfamily\cyrillicfonttt{Tempora}
+lang: "ru-RU"
+---
+
+## Работа с датасетами и предобработка данных
+
+На первом этапе я загружу необходимые данные - датасет об объеме социальных выплат и налогооблагаемых доходов (дальше - датасет ростата) и версионный справочник муниципальных образований (дальше - версионный справочник). Замечу, что скаченный по ссылке в ТЗ датасет с социальными выплатами и доходами не содержит 2023 год, поэтому в качестве финального года я буду брать 2022 в последующих заданиях. Полный код для предобработки доступен в приложенном Rmd файле.
+
+```{r include=FALSE}
+# loading the packages
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+library(showtext)
+library(extrafont)
+
+
+# Load fonts
+loadfonts()
+
+# Automatically use showtext for ggplot2
+showtext_auto()
+
+
+# specifying the path to file
+file_path <- "D:\\GitHubProjects\\causal_project\\Urov-14a_2010-2022.xlsx"
+
+# getting the names of all sheets in the file
+sheet_names <- excel_sheets(file_path)
+
+# defining the years of interest
+years_of_interest <- as.character(2018:2022)
+
+# Filter the sheet names to include only those that are in the specified range
+filtered_sheet_names <- sheet_names[sheet_names %in% years_of_interest]
+new_column_names <- c("id", "mun_name", "oktmo", "taxable_income", "social_payments", "income_payments_overall", "income_payments_pc")  # Adjust names as needed
+
+# Loop through each filtered sheet name and read its content
+for (sheet in filtered_sheet_names) {
+  # Create a variable name based on the sheet name
+  var_name <- paste0("df_", sheet)  # Ensure it's a valid variable name
+  assign(var_name, read_excel(file_path, sheet = sheet, skip = 5, col_names = new_column_names), envir = .GlobalEnv)
+}
+
+```
+
+Я собираюсь объединить два датасета на основе кода ОКТМО, т.е. каждой версии ОКТМО из справочника, соответствующей определенному году, я буду сопоставлять ОКТМО из датасета ростата за определенный год. Такой подход позволяет быстро покрыть около 95\% всех муниципалитетов в каждом году. Оставшиеся муниципалитеты я на данном этапе не рассматриваю, потому что предполагаю, что их можно считать случайными пропусками. В будущем можно настроить эту систему более хитро, - например, после объединения датасетов по ОКТМО несовпадения можно попытаться сопоставить на основе названия и региона. Я предварительно пробовал этот вариант - даже после повторного мэтча по названию остается около 5\% несопоставленных муниципалитетов. Общая идея этого подхода - после сопоставления по ОКТМО в каждом году для большинства муниципалитетов мы получаем новую колонку из версионного справочника - **territory_id**. По ней можно будет отследить непрерывный ряд, поскольку это уникальный индификатор территории, который неизменен при изменении типа, названия и кода, но меняется при изменении границ - это те условия, которые требуются в ТЗ.
+
+Я предварительно не предобрабатывал датасеты в Excel, поэтому переложим эту ответственность на R. Напишем функцию, которая учтет всевозможные формы написания ОКТМО в датасете ростата. 
+
+```{r warning = FALSE, message=FALSE}
+# Function to standardize ID format
+standardize_oktmo <- function(id) {
+  # handling missing values
+  if (is.na(id)) {
+    return(NA)
+  }
+
+  # removing any existing non-digit characters
+  id <- gsub("[^0-9]", "", id)
+  
+  # checking if the ID has length 2 (e.g., "01", "99")
+  if (nchar(id) == 2) {
+    return(id)  # Keep as is
+  }
+
+    # checking if the ID has length 7 (for cases like "3601000")
+  if (nchar(id) == 7) {
+    # adding a leading "0" to make it 8 characters
+    id <- paste0("0", id)
+  }
+  
+  # splitting the ID into the required format: "xx-xxx-xxx-xxx" by inserting "-"
+  formatted_id <- paste0(substr(id, 1, 2), "-", substr(id, 3, 5), "-", substr(id, 6, 8), "-000")
+  return(formatted_id)
+}
+
+```
+
+Дальше я получаю из данных ростата 2018 года список всех регионов, чтобы присвоить каждому муниципалитету его региональную привязку для дальнейшего анализа, в т.ч. обрабатывая случаи НАО, ХМАО, ЯНАО. Весь код для препроцессинга - в Rmd файле.
+
+
+```{r include=FALSE}
+df_2018$mun_name <- gsub(" - всего", "", df_2018$mun_name)
+df_2018$mun_name <- trimws(df_2018$mun_name, which = "r")
+unique(df_2018[nchar(df_2018$oktmo) < 3 | grepl("000000", df_2018$oktmo), ])
+df_2018$oktmo <- gsub("44000000", "44", df_2018$oktmo)
+df_2018[grepl("44", df_2018$oktmo) & nchar(df_2018$oktmo) == 2,]
+df_2018$oktmo <- ifelse(df_2018$mun_name == "Ненецкий автономный округ", "11", 
+                        ifelse(df_2018$mun_name == "Ханты-Мансийский автономный округ", "71", 
+                        ifelse(df_2018$mun_name == "Ямало-Ненецкий автономный округ", "71", df_2018$oktmo)))
+df_2018$oktmo_mod <- ifelse(df_2018$mun_name == "Ненецкий автономный округ", "118", 
+                        ifelse(df_2018$mun_name == "Ханты-Мансийский автономный округ", "718", 
+                        ifelse(df_2018$mun_name == "Ямало-Ненецкий автономный округ", "719", df_2018$oktmo)))
+df_2018[grepl("Ненецкий автономный округ", df_2018$mun_name), ] 
+
+df_2018$oktmo_id <- sapply(df_2018$oktmo, standardize_oktmo)
+df_2018[nchar(df_2018$oktmo) < 4 & !is.na(df_2018$oktmo),]
+
+
+regions_names <- df_2018[!is.na(df_2018$oktmo_id) & nchar(df_2018$oktmo_id) < 3 | grepl("Ненецкий автономный округ", df_2018$mun_name), ] 
+nrow(regions_names)
+
+# Create the dictionary as a named vector
+oktmo_dict <- setNames(regions_names$mun_name, regions_names$oktmo_mod)
+
+
+df_2018$region_test <- ifelse(
+    nchar(df_2018$oktmo_mod) == 3,
+    oktmo_dict[substr(df_2018$oktmo_mod, 1, 3)],
+    oktmo_dict[substr(df_2018$oktmo_id, 1, 2)]
+  )
+
+df_2018 %>% filter(oktmo_mod == "718")
+
+
+```
+
+
+```{r}
+# function to process each dataframe
+process_data <- function(df, oktmo_dict) {
+  # standardising oktmo and creating oktmo_id
+  df$mun_name <- gsub(" - всего", "", df$mun_name)
+  df$mun_name <- trimws(df$mun_name, which = "r")
+  df$oktmo <- ifelse(df$mun_name == "Ненецкий автономный округ", "11", df$oktmo)
+  df$oktmo_mod <- ifelse(df$mun_name == "Ненецкий автономный округ", "118", 
+                        ifelse(df$mun_name == "Ханты-Мансийский автономный округ", "718", 
+                        ifelse(df$mun_name == "Ямало-Ненецкий автономный округ", "719", df$oktmo)))
+  df$oktmo_id <- sapply(df$oktmo, standardize_oktmo)
+  # assiging region based on oktmo_dict
+  # and conditional expression to assign specific cases:
+  df$region <- ifelse(
+   substr(df$oktmo_mod, 1, 3) == "118", "Ненецкий автономный округ",
+   ifelse(substr(df$oktmo_mod, 1, 3) == "718", "Ханты-Мансийский автономный округ",
+   ifelse(substr(df$oktmo_mod, 1, 3) == "719", "Ямало-Ненецкий автономный округ",
+   ifelse(nchar(df$oktmo_mod) == 3,
+    oktmo_dict[substr(df$oktmo_mod, 1, 3)],
+    oktmo_dict[substr(df$oktmo_id, 1, 2)]
+  ))))
+  return(df)
+}
+
+```
+
+
+
+```{r include=FALSE}
+# creating a list of dfs to process
+dfs <- list(df_2018, df_2019, df_2020, df_2021, df_2022)
+
+# assign the function to each df
+dfs <- lapply(dfs, process_data, oktmo_dict = oktmo_dict)
+# unpacking the list of lists
+df_2018 <- dfs[[1]]
+df_2019 <- dfs[[2]]
+df_2020 <- dfs[[3]]
+df_2021 <- dfs[[4]]
+df_2022 <- dfs[[5]]
+
+setdiff(regions_names %>% pull(mun_name), unique(df_2018$region))
+df_2018 %>% filter(is.na(region))
+df_2018[grepl("Ненецкий автономный округ", df_2018$region), ]
+df_2018[grepl("Ханты-Мансийский автономный округ", df_2018$region), ]
+
+unique(df_2019$region)
+unique(df_2020$region)
+unique(df_2021$region)
+unique(df_2022$region)
+
+df_2022[grepl("Ненецкий автономный округ", df_2022$region), ]
+
+```
+
+
+```{r include=FALSE}
+df_2018$year <- as.Date("2018-01-01")
+df_2019$year <- as.Date("2019-01-01")
+df_2020$year <- as.Date("2020-01-01")
+df_2021$year <- as.Date("2021-01-01")
+df_2022$year <- as.Date("2022-01-01")
+
+df_2018 <- df_2018 %>% select(!c(region_test))
+df_2018 %>% filter(region =="Ненецкий автономный округ")
+df_2018[grepl("118", df_2018$oktmo), ]
+
+```
+
+
+```{r include=FALSE}
+setwd('D:\\GitHubProjects\\causal_project')
+sberindex_data <- read_excel("t_dict_municipal\\t_dict_municipal_districts.xlsx")
+
+# Reminder: `year_to` не включает год записи.
+```
+
+После загрузки справочника Сбериндекса отсортируем наблюдения, согласно документации. 
+
+
+```{r results = 'hide'}
+sberindex_data_2018 <- sberindex_data[sberindex_data$year_from <= 2018 & sberindex_data$year_to > 2018, ]
+sberindex_data_2019 <- sberindex_data[sberindex_data$year_from <= 2019 & sberindex_data$year_to > 2019, ]
+sberindex_data_2020 <- sberindex_data[sberindex_data$year_from <= 2020 & sberindex_data$year_to > 2020, ]
+sberindex_data_2021 <- sberindex_data[sberindex_data$year_from <= 2021 & sberindex_data$year_to > 2021, ]
+sberindex_data_2022 <- sberindex_data[sberindex_data$year_from <= 2022 & sberindex_data$year_to > 2022, ]
+
+```
+```{r include=FALSE}
+nrow(sberindex_data_2018)
+nrow(sberindex_data_2019)
+nrow(sberindex_data_2020)
+nrow(sberindex_data_2021)
+nrow(sberindex_data_2022)
+
+```
+
+
+```{r include=FALSE}
+df2018_stats <- df_2018 %>% filter(nchar(oktmo_id) > 2 & !(mun_name == "Муниципальные районы" |
+                          mun_name == "Городские округа" | mun_name == "Административные районы")) %>% 
+  rename(oktmo_raw = oktmo,
+         oktmo = oktmo_id)
+
+df2019_stats <- df_2019 %>% filter(nchar(oktmo_id) > 2 & !(mun_name == "Муниципальные районы" |
+                          mun_name == "Городские округа" | mun_name == "Административные районы")) %>% 
+  rename(oktmo_raw = oktmo,
+         oktmo = oktmo_id)
+
+df2020_stats <- df_2020 %>% filter(nchar(oktmo_id) > 2 & !(mun_name == "Муниципальные районы" |
+                          mun_name == "Городские округа" | mun_name == "Административные районы")) %>% 
+  rename(oktmo_raw = oktmo,
+         oktmo = oktmo_id)
+
+df2021_stats <- df_2021 %>% filter(nchar(oktmo_id) > 2 & !(mun_name == "Муниципальные районы" |
+                          mun_name == "Городские округа" | mun_name == "Административные районы")) %>% 
+  rename(oktmo_raw = oktmo,
+         oktmo = oktmo_id)
+
+df2022_stats <- df_2022 %>% filter(nchar(oktmo_id) > 2 & !(mun_name == "Муниципальные районы" |
+                          mun_name == "Городские округа" | mun_name == "Административные районы")) %>% 
+  rename(oktmo_raw = oktmo,
+         oktmo = oktmo_id)
+
+```
+
+
+```{r include=FALSE}
+#unique(df2019_stats$region)
+#unique(df2021_stats$region)
+
+```
+
+
+## Построение рядов на основе ID муниципалитета
+
+Объединим по ОКТМО все муниципалитеты за определенный год из двух датасетов, следуя логике версионности, - слияние по ОКТМО происходит в том случае, если муниципалитет в версионном справочнике входит во временные границы, задаваемые значениями колонок `year_from` и `year_to`.
+
+```{r include=FALSE}
+sberindex_data_2018_processed <- sberindex_data_2018 %>% 
+  select(municipal_district_name_short, oktmo, territory_id, 
+         change_id_from, change_id_to, region_name)
+
+
+df2018_stats_merged <- merge(sberindex_data_2018_processed, df2018_stats,
+                             by = "oktmo", 
+                             all.y = TRUE)
+
+df2018_stats_merged %>% filter(is.na(territory_id)) %>% select(oktmo, id, region, year)
+
+
+sberindex_data_2019_processed <- sberindex_data_2019 %>% 
+  select(municipal_district_name_short, oktmo, territory_id, 
+         change_id_from, change_id_to, region_name)
+
+df2019_stats_merged <- merge(sberindex_data_2019_processed, df2019_stats,
+                             by = "oktmo", 
+                             all.y = TRUE)
+
+df2019_stats_merged %>% filter(is.na(territory_id))
+
+sberindex_data_2020_processed <- sberindex_data_2020 %>% 
+  select(municipal_district_name_short, oktmo, territory_id, 
+         change_id_from, change_id_to, region_name)
+
+df2020_stats_merged <- merge(sberindex_data_2020_processed, df2020_stats,
+                             by = "oktmo", 
+                             all.y = TRUE)
+
+df2020_stats_merged %>% filter(is.na(territory_id))
+
+
+sberindex_data_2021_processed <- sberindex_data_2021 %>% 
+  select(municipal_district_name_short, oktmo, territory_id, 
+         change_id_from, change_id_to, region_name)
+
+df2021_stats_merged <- merge(sberindex_data_2021_processed, df2021_stats,
+                             by = "oktmo", 
+                             all.y = TRUE)
+
+df2021_stats_merged %>% filter(is.na(territory_id))
+
+sberindex_data_2022_processed <- sberindex_data_2022 %>% 
+  select(municipal_district_name_short, oktmo, territory_id, 
+         change_id_from, change_id_to, region_name)
+
+df2022_stats_merged <- merge(sberindex_data_2022_processed, df2022_stats,
+                             by = "oktmo", 
+                             all.y = TRUE)
+
+df2022_stats_merged %>% filter(is.na(territory_id))
+
+```
+
+
+```{r include=FALSE}
+df_stats_merged <- rbind(df2018_stats_merged,
+      df2019_stats_merged,
+      df2020_stats_merged,
+      df2021_stats_merged,
+      df2022_stats_merged)
+
+```
+
+
+```{r echo=FALSE}
+
+df_stats_merged %>% filter(territory_id == 734) %>% select(oktmo, mun_name, territory_id, region, year, taxable_income, social_payments) %>% kable()
+#df_stats_merged %>% filter(territory_id == 882)
+
+```
+
+
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+ggplot(df_stats_merged %>% filter(territory_id == 882 |
+                                  territory_id == 2116), aes(x = year, y = social_payments, color = as.factor(territory_id), group = as.factor(territory_id))) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Динамика социальных выплат в муниципалитетах",
+       subtitle = "Жарковский (Тверская область) и Ромненский (Амурская область)",
+       x = "Год",
+       y = "Социальные и другие выплаты, тыс.рублей") + 
+  theme_minimal() + 
+  theme(legend.position = "right") +
+  scale_color_manual(name = "ID территории", values = c("882" = "882 (10-540-000-000)",
+                                                        "2116" = "2116 (28-614-000-000)")) 
+
+
+
+```
+
+
+Получаем ряд 882 (10-540-000-000) выше, для которого выполняются требования: при условии, что название ОКТМО менялось, у территории одинаковый индекс **territory_id** на протяжении всех пяти лет наблюдений. Однако такого результата удалось достичь не для всех муниципалитетов. В нескольких рассмотренных мною случаях проблема сводилась к тому, что в датасете ростата был старый ОКТМО, в то время как в версионном справочнике уже был прописан новый. Муниципалитет с ID 2116 (28-614-000-000) как раз обрывается в 2021 году, поскольку в 2022 в справочнике он имеет ОКТМО 28-614-000-000, а в датасете ростата 28-514-000-000, ввиду чего теряется часть информации. Потенциально проблему могло бы решить сопоставление как по ОКТМО, так и по названию (с контролем на регион, чтобы не наткнуться на дублирующие названия в разных регионах), но не всегда название в версионном справочнике совпадало с названием в датасете ростата. Например, *Нерехтский и г.Нерехта* (ростат) vs. *Нерехта и Нерехтский* (справочник). Такие ограничения не позволяют на сто процентов сопоставить все муниципалитеты. 
+
+Если я правильно понял, то под присвоением актуального действующого кода ОКТМО подразумевается, что мы должны назначить самый поздний ОКТМО для `territory_id`. Ниже я предлагаю код, который это делает, и визуализацию результатов. Теперь даже в случае изменения ОКТМО или названия муниципалитета, он имеет постоянное наименование по самому недавнему коду ОКТМО.
+
+```{r}
+# Отфильтруем справочник, чтобы оставить только самую позднюю запись для каждого territory_id
+latest_reference <- sberindex_data %>%
+  filter(!is.na(territory_id)) %>%
+  group_by(territory_id) %>%
+  filter(year_from == max(year_from)) %>%
+  ungroup() %>% select(oktmo, territory_id) %>% rename(oktmo_new = oktmo)
+
+# Соединяем основной датасет с отфильтрованным справочником по territory_id и year
+final_data <- df_stats_merged %>% filter(!is.na(territory_id)) %>%
+  left_join(latest_reference, by = "territory_id")
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', fig.width=5, fig.height=7}
+final_data %>% filter(region == "Пермский край") %>% 
+  ggplot(aes(x=year, y=log(taxable_income))) + 
+  geom_point(aes(color = oktmo_new)) +
+  geom_line(aes(color = oktmo_new)) + theme_bw() + theme(legend.position = "top") 
+
+```
+
+
+## Дескриптивный анализ и визуализация
+
+```{r include=FALSE}
+df_stats_modified <- df_stats_merged %>% mutate(soc_paym_share = social_payments / income_payments_overall)
+
+agg_data <- df_stats_modified %>%
+  group_by(region, year) %>%
+  summarise(mean_social_welfare_share = mean(soc_paym_share, na.rm = TRUE))
+
+data_2018 <- agg_data %>% filter(year == as.Date("2018-01-01"))
+data_2022 <- agg_data %>% filter(year == as.Date("2022-01-01"))
+
+change_data <- merge(data_2018, data_2022, by = "region", suffixes = c("_2018", "_2022"))
+change_data <- change_data %>%
+  mutate(change = mean_social_welfare_share_2022 - mean_social_welfare_share_2018)
+
+
+# Упорядочиваем регионы по значениям доли социальных выплат за 2022 год
+change_data_ordered <- change_data %>%
+  mutate(region = reorder(region, mean_social_welfare_share_2022))
+
+
+```
+
+Столбчатая диаграмма ниже визуализирует изменение в доли социальных выплат в 2018 и 2022 годах. Общий тренд - на снижение этой доли в 2022 году по сравнению с 2018 г. Такое снижение может диктоваться двумя механизмами - либо люди стали больше зарабатывать (увеличилась доля других частных доходов), либо уменьшились социальные расходы государства. Уменьшение социальных расходов может быть связано, например, с уменьшением уровня безработицы, снижением рождаемости (меньше семей соответствуют условиям выплат маткапитала), уменьшением доли тех, кому положены пенсии (Пенсионная реформа 2019 года и повышенная смертность от COVID-19), переход от монетарной поддержки к материальной (выдача инвалидного кресла вместо эквивалентной денежной суммы). В целом, в российской социальной политике заметен тренд на адресную социальную поддержку, которая сужает охват целевых групп. Не исключено, что оба фактора - и увеличение частных доходов, и снижение социальных расходов государства - могли иметь место одновременно.
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', fig.width=8, fig.height=5}
+ggplot(change_data_ordered, aes(x = region)) +
+  geom_bar(aes(y = mean_social_welfare_share_2018, fill = "2018"), stat = "identity", position = "dodge") +
+  geom_bar(aes(y = mean_social_welfare_share_2022, fill = "2022"), stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("2018" = "skyblue", "2022" = "coral"), name = "Год") +
+  labs(x = "Регион России", y = "Доля социальных выплат", title = "Изменение доли социальных выплат в 2018 и 2022 годах") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+Чтобы отыскать, какие именно регионы все же увеличили долю социальных выплат, построим столбчатую диаграмму, которая отражает изменение средней доли социальных выплат по регионам. Оказывается, что всего 17 регионов - Дагестан, Кабардино-Балкария, Ставропольский Край, Тыва, среди прочего, - слегка увеличили долю выплат. 
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', fig.width=8, fig.height=15}
+ggplot(change_data, aes(x = reorder(region, change), y = change, fill = change > 0)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(values = c("coral", "lightgreen"), labels = c("Уменьшение", "Увеличение")) +
+  labs(title = "Изменение средней доли социальных выплат",
+       subtitle = "по регионам (2018 vs. 2022)",
+       x = "Регион",
+       y = "Изменение доли социальных выплат (%)") +
+  theme_minimal()
+
+#change_data %>% filter(change > 0)
+```
+
+Наконец, чтобы проследить динамику во весь период с 2018 по 2022, я использую тепловую карту. 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', fig.width=8, fig.height=10}
+ggplot(agg_data, aes(x = factor(year), y = region, fill = mean_social_welfare_share)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "blue", high = "red", name = "Доля соц. выплат (%)") +
+  labs(title = "Тепловая карта",
+       subtitle = "средней доли социальных выплат по регионам и годам",
+       x = "Год",
+       y = "Регион") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+Эта карта показывает, что ростат по какой-то причине перестал давать статистику по ряду регионов (79 в 2022 vs 83 в 2018). Тепловая карта показывает, что внутри одного региона изменения в доли социальных выплат не такие большие, как между регионами, что, с одной стороны, может говорить об институциональной инерции. С другой стороны,  во многих регионах видно "посинение" - снижение доли социальных выплат в объеме доходов населения муниципальных образований.
+
+## Гипотетический дизайн исследования и его проблемы
+
+
+Дизайн исследования, направленного на оценку влияния инвестиционных проектов на налогооблагаемые денежные доходы граждан, предполагает несколько стратегических выборов на этапе планирования исследования. Я кратко опишу несколько из них: например, нужно «на берегу» определиться с тем, какого типа инвестиционные проекты попадут в исследование, поскольку нужно сузить понимание того, эффект каких именно инвестиционных проектов мы собираемся исследовать. Альтернативой могло бы быть включение типа инвестиционного проекта (например, проекты в сфере жилищного строительства, проекты транспортной инфраструктуры, экологические проекты и т.д.) в анализ, а именно предположение того, что эффект может быть гетерогенным в зависимости от типа проекта и механизма, через который происходит причинно-следственная связь. Если у нас есть информация по типам проектов, то мы могли бы оценить «средний» эффект реализации инвестиционного проекта, а затем посмотреть на то, какие эффекты производят инвестиционные проекты разного типа. 
+
+Это предварительное замечание связано с тем, что на этапе планирования исследования нужно выбрать теоретический и эмпирический эстиманды – те контрфактуальные величины, оценку которых мы бы хотели получить с помощью выбранного нами подхода. В качестве точки отсчета можно взять оценку среднего эффекта воздействия. Если в наиболее простом случае инвестиционные проекты реализовывались в муниципалитетах случайно, т.е. не зависели от прочих характеристик муниципалитетов, то простая разница средних давала бы несмещенную оценку. Однако такой взгляд не совсем реалистичен, поскольку такие проекты предполагают изучение местных (социальных, политических и бизнес-) условий инвесторами, а потому могут быть сильно завязаны на социально-экономические показатели муниципалитетов. Ввиду этой особенности при оценке эффекта простой разницей средних возникает так называемая ошибка отбора (selection bias). Так, способ отбора муниципалитетов для участия в программе будет определять дизайн исследования, поскольку если каждый муниципалитет с равной вероятностью может попасть в группу воздействия, то такие условия можно считать экспериментальными, а создавшуюся в результате вариацию в зависимой переменной атрибутировать именно воздействию (факту наличия инвестиционного проекта). Если же мы предполагаем, что есть внешние факторы, которые определяли шансы попадания муниципалитета в группу воздействия и они замерены, мы можем использовать техники мэтчинга, чтобы добиться сопоставимости группы воздействия и группы контроля по набору ковариат, замеренных до воздействия.  
+
+Другой вариант потенциального смещения оценки – если программа реализовывалась централизованно и разработчиками учитывались характеристики муниципальных образований при отборе, то муниципалитеты с определенными характеристиками с большей вероятностью могли получить воздействие (например, программа должна была «поднять» отстающие муниципалитеты до среднего уровня, таким образом, воздействие, скорее, оказывалось на наиболее нуждающихся, что нарушает SUTVA. Для того чтобы снизить влияние этой проблемы, можно произвести взвешивание по стратам, чтобы получить оценки, специфичные для страт. 
+
+Различающийся масштаб инвестиций предполагает, что при разном значении $d$ (дозы воздействия) эффект будет различаться. Мы можем построить функцию дозу-отклик, если изменим наше воздействие с бинарного на непрерывное. Либо же мы можем получить оценки для разных уровней инвестиций, если запустим отдельные модели для маленького, среднего и высокого масштабов инвестиций. Еще одна альтернатива – запустить одну модель, где включить взаимодействие между воздействием ($D$ – фактом наличия инвестиционного проекта) и масштабом инвестиций (разбить эту переменную на категории). 
+
+В идеале нам хотелось бы, чтобы количество муниципалитетов в двух группах было примерно равным. Особенно остро эта проблема может встать при мэтчинге, когда для и без того небольшой экспериментальной группы нужно будет отыскать пары в контрольной. В целом, чем больше муниципалитетов включено в исследование, тем выше будет статистическая мощность. Длительный период наблюдений также позволит учитывать временные эффекты, влияющие на доходы населения. 
+
+Я посчитал необходимым вначале ответить на последний вопрос в тестовом задании, потому что проблемы, поднятые выше, должны быть адресованы на этапе планирования исследования. Ниже же я предложу один из наиболее распространенных дизайнов для случая, когда воздействие было (квази-)случайным – разность-разностей (DiD). Мы можем замерить средний эффект воздействия на группу воздействия (ATT), используя вариацию между муниципалитетами, подвергшимися и не подвергшимися воздействию во времени. Я опишу базовый подход, но дополнительно сошлюсь на литературу по дизайну разность-разностей, когда воздействие наступает не одномоментно, а в разные временные периоды (см. литературу по Event-study DiD и Staggered DiD). Так, если предположение о параллельности трендов выполняется – в отсутствие воздействия тренды зависимой переменной в группах воздействия и контроля были бы одинаковым, – то мы могли бы оценить эффект инвестиционных проектов на муниципалитеты, подвергшиеся воздействию, по сравнению с гипотетической ситуацией, когда эти же муниципалитеты не получили воздействие. Именно предположение о параллельности трендов позволяет нам использовать наблюдения в контрольной группе для рассчета (или восстановления / импутации) контрфактуального тренда (контрфактуальных значений) в группе воздействия. 
+
+
+
+
+
+
